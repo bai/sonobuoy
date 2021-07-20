@@ -5,27 +5,162 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: actions/setup-go@v2
-        with:
-          go-version: 1.15
-      - name: make local-test
+      - name: Run unit tests
         env:
           VERBOSE: true
         run: |
-          make local-test
+          source ./scripts/build.sh; unit
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 5
+      - name: Show history for debug help
+        run: |
+          git log --oneline -n 5
+      - name: Build binaries and images
+        run: |
+          source ./scripts/build.sh
+          build_binaries
+          linux_containers
+          build_test_image
+      - name: Save images to tar
+        run: |
+          source ./scripts/build.sh
+          save_images_to_tar
+      - name: Save artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: sonobuoy-build-linux-${{ github.run_id }}
+          path: |
+            build
+  build-windows:
+    runs-on: ubuntu-latest
+    needs: [integration-test-on-kind]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Inspect builder
+        run: |
+          echo "Name:      ${{ steps.buildx.outputs.name }}"
+          echo "Endpoint:  ${{ steps.buildx.outputs.endpoint }}"
+          echo "Status:    ${{ steps.buildx.outputs.status }}"
+          echo "Flags:     ${{ steps.buildx.outputs.flags }}"
+          echo "Platforms: ${{ steps.buildx.outputs.platforms }}"
+      - name: Build binaries and images
+        run: |
+          source ./scripts/build.sh
+          build_binary_GOOS_GOARCH windows amd64
+          windows_containers
+      - name: Save artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: sonobuoy-build-windows-${{ github.run_id }}
+          path: |
+            build
   stress-test-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - name: make stress-test
+      - name: Run stress tests
         env:
           VERBOSE: true
         run: |
-          make stress
+          source ./scripts/build.sh; stress
   integration-test-on-kind:
     runs-on: ubuntu-latest
+    needs: [build-linux, unit-test-linux]
     steps:
       - uses: actions/checkout@v2
-      - name: run tests
+        with:
+          fetch-depth: 5
+      - name: Show history for debug help
         run: |
-          SONOBUOY_CLI=../../build/linux/amd64/sonobuoy ./scripts/run_integration_tests.sh
+          git log --oneline -n 5
+      - name: Prepare cluster for tests
+        run: |
+          source ./scripts/build.sh;
+          clean
+          setup_kind_cluster
+      - name: Download binaries and prebuilt images
+        uses: actions/download-artifact@v2
+        with:
+          name: sonobuoy-build-linux-${{ github.run_id }}
+          path: build
+      - name: Ensure binaries are executable
+        run: |
+          chmod +x build/linux/amd64/sonobuoy
+      - name: Show downloaded file info
+        run: |
+          pwd
+          ls -lah
+          find ./build
+      - name: Build test image, load images, and run tests
+        run: |
+          docker load -i build/testimage-${{ github.run_id }}.tar
+          docker load -i build/linux/amd64/sonobuoy-img-linux-amd64-${{ github.run_id }}.tar
+          docker image ls
+          source ./scripts/build.sh
+          load_test_images_into_cluster
+          VERBOSE=true SONOBUOY_CLI=../../build/linux/amd64/sonobuoy integration
+  push-images:
+    if: ${{ github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-windows, unit-test-linux, integration-test-on-kind, stress-test-linux]
+    steps:
+      - uses: actions/checkout@v2
+      - name: Download binaries and prebuilt images
+        uses: actions/download-artifact@v2
+        with:
+          name: sonobuoy-build-linux-${{ github.run_id }}
+          path: build
+      - name: Download binaries and prebuilt images
+        uses: actions/download-artifact@v2
+        with:
+          name: sonobuoy-build-windows-${{ github.run_id }}
+          path: build
+      - name: Load images and verify
+        run: |
+          docker load -i build/linux/amd64/sonobuoy-img-linux-amd64-${{ github.run_id }}.tar
+          docker load -i build/linux/arm64/sonobuoy-img-linux-arm64-${{ github.run_id }}.tar
+          docker image ls
+      - name: Login to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push images
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          source ./scripts/build.sh
+          gen_manifest_and_push_all
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    needs: [push-images]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v2
+        with:
+          go-version: 1.16
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v2
+        with:
+          version: latest
+          args: release --rm-dist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

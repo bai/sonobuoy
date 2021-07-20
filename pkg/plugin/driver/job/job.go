@@ -136,10 +136,6 @@ func (p *Plugin) createPodDefinition(hostname string, cert *tls.Certificate, own
 		podSpec.Volumes = append(podSpec.Volumes, v.Volume)
 	}
 
-	// TODO revise this once we support windows nodes, https://github.com/vmware-tanzu/sonobuoy/issues/732
-	pod.Spec.NodeSelector = map[string]string{
-			"kubernetes.io/os": "linux",
-	}
 	pod.Spec = podSpec
 	return pod
 }
@@ -177,7 +173,7 @@ func (p *Plugin) Monitor(ctx context.Context, kubeclient kubernetes.Interface, _
 		case <-ctx.Done():
 			switch {
 			case ctx.Err() == context.DeadlineExceeded:
-				logrus.Errorf("Timeout waiting for plugin %v", p.GetName())
+				logrus.Errorf("Timeout waiting for plugin %v. Try checking the pod logs and other data in the results tarball for more information.", p.GetName())
 				resultsCh <- utils.MakeErrorResult(
 					p.GetName(),
 					map[string]interface{}{"error": plugin.TimeoutErrMsg},

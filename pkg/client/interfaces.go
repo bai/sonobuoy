@@ -52,14 +52,14 @@ func (lc *LogConfig) Validate() error {
 
 // GenConfig are the input options for generating a Sonobuoy manifest.
 type GenConfig struct {
-	E2EConfig            *E2EConfig
-	Config               *config.Config
-	EnableRBAC           bool
-	ImagePullPolicy      string
-	KubeConformanceImage string
-	SystemdLogsImage     string
-	SSHKeyPath           string
-	SSHUser              string
+	// Plugin transforms allows us to lazily apply generic transformations
+	// to plugins after loading them.
+	PluginTransforms map[string][]func(*manifest.Manifest) error
+
+	Config          *config.Config
+	EnableRBAC      bool
+	ImagePullPolicy string
+	SSHKeyPath      string
 
 	// DynamicPlugins are plugins which we know by name and whose manifest
 	// YAML are generated dynamically using the GenConfig settings.
@@ -82,29 +82,17 @@ type GenConfig struct {
 	NodeSelectors map[string]string
 
 	// ShowDefaultPodSpec determines whether or not the default pod spec for
-	// the plugin should be incuded in the output.
+	// the plugin should be included in the output.
 	ShowDefaultPodSpec bool
+
+	// The version of Kubernetes to assume. Used to surface for plugin images
+	// and env vars.
+	KubeVersion string
 }
 
 // Validate checks the config to determine if it is valid.
 func (gc *GenConfig) Validate() error {
-	if gc.E2EConfig == nil {
-		return errors.New("nil E2EConfig provided")
-	}
-
 	return nil
-}
-
-// E2EConfig is the configuration of the E2E tests.
-type E2EConfig struct {
-	Focus    string
-	Skip     string
-	Parallel string
-
-	// CustomRegistries is the contents of a yaml file which will be
-	// used as KUBE_TEST_REPO_LIST which overrides which registries
-	// e2e tests use.
-	CustomRegistries string
 }
 
 // RunConfig are the input options for running Sonobuoy.
@@ -117,12 +105,6 @@ type RunConfig struct {
 
 // Validate checks the config to determine if it is valid.
 func (rc *RunConfig) Validate() error {
-	// If given a manifest, just load it as-is.
-	if len(rc.GenFile) == 0 {
-		err := rc.GenConfig.Validate()
-		return errors.Wrap(err, "GenConfig validation failed")
-	}
-
 	return nil
 }
 

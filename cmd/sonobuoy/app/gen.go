@@ -24,8 +24,8 @@ import (
 	"github.com/vmware-tanzu/sonobuoy/pkg/config"
 	"github.com/vmware-tanzu/sonobuoy/pkg/errlog"
 	imagepkg "github.com/vmware-tanzu/sonobuoy/pkg/image"
+	"github.com/vmware-tanzu/sonobuoy/pkg/plugin/manifest"
 
-	"github.com/imdario/mergo"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -34,22 +34,14 @@ import (
 )
 
 type genFlags struct {
-	sonobuoyConfig              SonobuoyConfig
-	mode                        client.Mode
-	rbacMode                    RBACMode
-	kubecfg                     Kubeconfig
-	namespace                   string
-	dnsNamespace                string
-	dnsPodLabels                []string
-	sonobuoyImage               string
-	kubeConformanceImage        string
-	systemdLogsImage            string
-	sshKeyPath                  string
-	sshUser                     string
-	kubeConformanceImageVersion imagepkg.ConformanceImageVersion
-	imagePullPolicy             ImagePullPolicy
-	timeoutSeconds              int
-	showDefaultPodSpec          bool
+	sonobuoyConfig     SonobuoyConfig
+	rbacMode           RBACMode
+	kubecfg            Kubeconfig
+	dnsNamespace       string
+	dnsPodLabels       []string
+	sshKeyPath         string
+	k8sVersion         imagepkg.ConformanceImageVersion
+	showDefaultPodSpec bool
 
 	// plugins will keep a list of the plugins we want. Custom type for
 	// flag support.
@@ -64,54 +56,46 @@ type genFlags struct {
 	// schedule on specific nodes.
 	nodeSelectors NodeSelectors
 
-	// These two fields are here since to properly squash settings down into nested
-	// configs we need to tell whether or not values are default values or the user
-	// provided them on the command line/config file.
-	e2eflags *pflag.FlagSet
-	genflags *pflag.FlagSet
+	pluginTransforms map[string][]func(*manifest.Manifest) error
 }
-
-// TODO(jschnake): Avoid using these globals if possible.
-var genflags genFlags
-var genSystemdLogsflags genFlags
-var genE2Eflags genFlags
 
 func GenFlagSet(cfg *genFlags, rbac RBACMode) *pflag.FlagSet {
 	genset := pflag.NewFlagSet("generate", pflag.ExitOnError)
-	AddModeFlag(&cfg.mode, genset)
+	cfg.sonobuoyConfig.Config = *config.New()
+	cfg.pluginTransforms = map[string][]func(*manifest.Manifest) error{}
 	AddSonobuoyConfigFlag(&cfg.sonobuoyConfig, genset)
 	AddKubeconfigFlag(&cfg.kubecfg, genset)
-	cfg.e2eflags = AddE2EConfigFlags(genset)
 	AddRBACModeFlags(&cfg.rbacMode, genset, rbac)
-	AddImagePullPolicyFlag(&cfg.imagePullPolicy, genset)
-	AddTimeoutFlag(&cfg.timeoutSeconds, genset)
+	AddImagePullPolicyFlag(&cfg.sonobuoyConfig.ImagePullPolicy, genset)
+	AddTimeoutFlag(&cfg.sonobuoyConfig.Aggregation.TimeoutSeconds, genset)
 	AddShowDefaultPodSpecFlag(&cfg.showDefaultPodSpec, genset)
 
-	AddNamespaceFlag(&cfg.namespace, genset)
+	AddNamespaceFlag(&cfg.sonobuoyConfig.Namespace, genset)
 	AddDNSNamespaceFlag(&cfg.dnsNamespace, genset)
 	AddDNSPodLabelsFlag(&cfg.dnsPodLabels, genset)
-	AddSonobuoyImage(&cfg.sonobuoyImage, genset)
-	AddKubeConformanceImage(&cfg.kubeConformanceImage, genset)
-	AddSystemdLogsImage(&cfg.systemdLogsImage, genset)
-	AddKubeConformanceImageVersion(&cfg.kubeConformanceImageVersion, genset)
-	AddSSHKeyPathFlag(&cfg.sshKeyPath, genset)
-	AddSSHUserFlag(&cfg.sshUser, genset)
+	AddSonobuoyImage(&cfg.sonobuoyConfig.WorkerImage, genset)
+	AddSSHKeyPathFlag(&cfg.sshKeyPath, &cfg.pluginTransforms, genset)
 
 	AddPluginSetFlag(&cfg.plugins, genset)
 	AddPluginEnvFlag(&cfg.pluginEnvs, genset)
+	AddLegacyE2EFlags(&cfg.pluginEnvs, &cfg.pluginTransforms, genset)
 
 	AddNodeSelectorsFlag(&cfg.nodeSelectors, genset)
-	cfg.genflags = genset
+
+	AddKubeConformanceImageVersion(&cfg.k8sVersion, &cfg.pluginTransforms, genset)
+	AddKubernetesVersionFlag(&cfg.k8sVersion, &cfg.pluginTransforms, genset)
+
+	AddPluginImage(&cfg.pluginTransforms, genset)
+	AddKubeConformanceImage(&cfg.pluginTransforms, genset)
+	AddSystemdLogsImage(&cfg.pluginTransforms, genset)
+
 	return genset
 }
 
 func (g *genFlags) Config() (*client.GenConfig, error) {
-	e2ecfg, err := GetE2EConfig(g.mode, g.e2eflags)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not retrieve E2E config")
+	if len(g.plugins.DynamicPlugins) == 0 && len(g.plugins.StaticPlugins) == 0 {
+		g.plugins.DynamicPlugins = []string{e2ePlugin, systemdLogsPlugin}
 	}
-
-	// TODO: Refactor this logic to be less convuled: https://github.com/vmware-tanzu/sonobuoy/issues/481
 
 	// In some configurations, the kube client isn't actually needed for correct executation
 	// Therefore, delay reporting the error until we're sure we need the client
@@ -127,77 +111,75 @@ func (g *genFlags) Config() (*client.GenConfig, error) {
 		return nil, err
 	}
 
-	var image string
-
-	// --kube-conformance-image overrides --kube-conformance-image-version
-	if g.kubeConformanceImage != "" {
-		image = g.kubeConformanceImage
-	} else {
-		// kubeclient can be null. Prevent a null-pointer exception by gating on
-		// that to retrieve the discovery client
+	var k8sVersion string
+	switch g.k8sVersion {
+	case "", imagepkg.ConformanceImageVersionAuto, imagepkg.ConformanceImageVersionLatest, imagepkg.ConformanceImageVersionIgnore:
 		var discoveryClient discovery.ServerVersionInterface
 		if kubeclient != nil {
 			discoveryClient = kubeclient.DiscoveryClient
 		}
 
-		// Only the `auto`  value requires the discovery client to be non-nil
-		// if discoveryClient is needed, ErrImageVersionNoClient will be returned and that error can be reported back up
-		imageRegistry, imageVersion, err := g.kubeConformanceImageVersion.Get(discoveryClient, imagepkg.DevVersionURL)
+		// `auto` k8s version needs resolution as well as any static plugins which use the
+		// variable SONOBUOY_K8S_VERSION. Just check for it all by default but allow skipping
+		// errors/resolution via flag.
+		_, k8sVersion, err = g.k8sVersion.Get(discoveryClient, imagepkg.DevVersionURL)
 		if err != nil {
-			if errors.Cause(err) == imagepkg.ErrImageVersionNoClient {
+			if errors.Cause(err) == imagepkg.ErrImageVersionNoClient &&
+				g.k8sVersion != imagepkg.ConformanceImageVersionIgnore {
 				return nil, errors.Wrap(err, kubeError.Error())
 			}
 			return nil, err
 		}
-
-		image = fmt.Sprintf("%v:%v", imageRegistry, imageVersion)
+	default:
+		k8sVersion = g.k8sVersion.String()
 	}
 
 	return &client.GenConfig{
-		E2EConfig:            e2ecfg,
-		Config:               g.resolveConfig(),
-		EnableRBAC:           rbacEnabled,
-		KubeConformanceImage: image,
-		SystemdLogsImage:     g.systemdLogsImage,
-		ImagePullPolicy:      g.imagePullPolicy.String(),
-		SSHKeyPath:           g.sshKeyPath,
-		SSHUser:              g.sshUser,
-		DynamicPlugins:       g.plugins.DynamicPlugins,
-		StaticPlugins:        g.plugins.StaticPlugins,
-		PluginEnvOverrides:   g.pluginEnvs,
-		ShowDefaultPodSpec:   g.showDefaultPodSpec,
-		NodeSelectors:        g.nodeSelectors,
+		Config:             &g.sonobuoyConfig.Config,
+		EnableRBAC:         rbacEnabled,
+		ImagePullPolicy:    g.sonobuoyConfig.ImagePullPolicy,
+		SSHKeyPath:         g.sshKeyPath,
+		DynamicPlugins:     g.plugins.DynamicPlugins,
+		StaticPlugins:      g.plugins.StaticPlugins,
+		PluginEnvOverrides: g.pluginEnvs,
+		ShowDefaultPodSpec: g.showDefaultPodSpec,
+		NodeSelectors:      g.nodeSelectors,
+		KubeVersion:        k8sVersion,
+		PluginTransforms:   g.pluginTransforms,
 	}, nil
 }
 
 func NewCmdGen() *cobra.Command {
+	var genflags genFlags
 	var GenCommand = &cobra.Command{
 		Use:   "gen",
 		Short: "Generates a sonobuoy manifest for submission via kubectl",
-		Run:   genManifest,
+		Run:   genManifest(&genflags),
 		Args:  cobra.ExactArgs(0),
 	}
 	GenCommand.Flags().AddFlagSet(GenFlagSet(&genflags, EnabledRBACMode))
 	return GenCommand
 }
 
-func genManifest(cmd *cobra.Command, args []string) {
-	cfg, err := genflags.Config()
-	if err != nil {
-		errlog.LogError(err)
+func genManifest(genflags *genFlags) func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
+		cfg, err := genflags.Config()
+		if err != nil {
+			errlog.LogError(err)
+			os.Exit(1)
+		}
+
+		// Generate does not require any client configuration
+		sbc := &client.SonobuoyClient{}
+
+		bytes, err := sbc.GenerateManifest(cfg)
+		if err == nil {
+			fmt.Printf("%s\n", bytes)
+			return
+		}
+		errlog.LogError(errors.Wrap(err, "error attempting to generate sonobuoy manifest"))
 		os.Exit(1)
 	}
-
-	// Generate does not require any client configuration
-	sbc := &client.SonobuoyClient{}
-
-	bytes, err := sbc.GenerateManifest(cfg)
-	if err == nil {
-		fmt.Printf("%s\n", bytes)
-		return
-	}
-	errlog.LogError(errors.Wrap(err, "error attempting to generate sonobuoy manifest"))
-	os.Exit(1)
 }
 
 // getClient returns a client if one can be found, and the error attempting to retrieve that client if not.
@@ -219,100 +201,4 @@ func getClient(kubeconfig *Kubeconfig) (*kubernetes.Clientset, error) {
 	}
 
 	return client, kubeError
-}
-
-// getConfig generates a config which has the the following rules:
-//  - command line options override config values
-//  - plugins specified manually via flags specifically override plugins implied by mode flag
-//  - config values override default values
-// NOTE: Since it mutates plugin values, it should be called before using them.
-func (g *genFlags) resolveConfig() *config.Config {
-	if g == nil {
-		return config.New()
-	}
-
-	conf := config.New()
-	suppliedConfig := g.sonobuoyConfig.Get()
-	if suppliedConfig != nil {
-		mergeConfigs(suppliedConfig, conf)
-		conf = suppliedConfig
-	}
-
-	// Resolve plugins.
-	//  - If using the plugin flags, no actions needed.
-	//  - Otherwise use the supplied config and mode to figure out the plugins to run.
-	//    This only works for e2e/systemd-logs which are internal plugins so then "Set" them
-	//    as if they were provided on the cmdline.
-	// Gate the logic with a nil check because tests may not specify flags and intend the legacy logic.
-	if g.genflags == nil || !g.genflags.Changed("plugin") {
-		// Use legacy logic; conf.SelectedPlugins or mode if not set
-		if conf.PluginSelections == nil {
-			modeConfig := g.mode.Get()
-			if modeConfig != nil {
-				conf.PluginSelections = modeConfig.Selectors
-			}
-		}
-
-		// Set these values as if the user had requested the defaults.
-		if g.genflags != nil {
-			for _, v := range conf.PluginSelections {
-				g.genflags.Lookup("plugin").Value.Set(v.Name)
-			}
-		}
-	}
-
-	// Have to embed the flagset itself so we can inspect if these fields
-	// have been set explicitly or not on the command line. Otherwise
-	// we fail to properly prioritize command line/config/default values.
-	if g.genflags == nil {
-		return conf
-	}
-
-	if g.genflags.Changed(namespaceFlag) {
-		conf.Namespace = g.namespace
-	}
-
-	if g.genflags.Changed(sonobuoyImageFlag) {
-		conf.WorkerImage = g.sonobuoyImage
-	}
-
-	if g.genflags.Changed(imagePullPolicyFlag) {
-		conf.ImagePullPolicy = g.imagePullPolicy.String()
-	}
-
-	if g.genflags.Changed(timeoutFlag) {
-		conf.Aggregation.TimeoutSeconds = g.timeoutSeconds
-	}
-
-	return conf
-}
-
-func mergeConfigs(dst, src *config.Config) {
-	// Workaround for the fact that an explicitly stated empty slice is still
-	// considered a zero value by mergo. This means that the value given
-	// by the user is not respected. Even a custom transformation can't
-	// get around this. See https://github.com/imdario/mergo/issues/118
-	emptyResources := false
-	if len(dst.Resources) == 0 && dst.Resources != nil {
-		emptyResources = true
-	}
-
-	// Workaround to differentiate a false value and a nil value
-	// Only override dst.Limits.PodLogs.SonobuoyNamespace when it's nil
-	// See https://github.com/imdario/mergo/issues/89
-	var sonobuoyNamespace *bool
-	if dst.Limits.PodLogs.SonobuoyNamespace != nil {
-		sonobuoyNamespace = new(bool)
-		*sonobuoyNamespace = *dst.Limits.PodLogs.SonobuoyNamespace
-	}
-
-	// Provide defaults but don't overwrite any customized configuration.
-	mergo.Merge(dst, src)
-
-	if emptyResources {
-		dst.Resources = []string{}
-	}
-	if sonobuoyNamespace != nil {
-		dst.Limits.PodLogs.SonobuoyNamespace = sonobuoyNamespace
-	}
 }

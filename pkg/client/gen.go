@@ -25,24 +25,24 @@ import (
 	"sort"
 	"strings"
 
-	version "github.com/hashicorp/go-version"
 	"github.com/pkg/errors"
 
 	"github.com/vmware-tanzu/sonobuoy/pkg/config"
 	"github.com/vmware-tanzu/sonobuoy/pkg/plugin"
+	"github.com/vmware-tanzu/sonobuoy/pkg/plugin/driver"
 	"github.com/vmware-tanzu/sonobuoy/pkg/plugin/manifest"
 	manifesthelper "github.com/vmware-tanzu/sonobuoy/pkg/plugin/manifest/helper"
-	"github.com/vmware-tanzu/sonobuoy/pkg/templates"
 
 	corev1 "k8s.io/api/core/v1"
 )
 
 const (
-	e2ePluginName                 = "e2e"
-	systemdLogsName               = "systemd-logs"
-	lastE2EVersionWithoutProgress = "1.16.99"
+	e2ePluginName   = "e2e"
+	systemdLogsName = "systemd-logs"
 
 	envVarKeyExtraArgs = "E2E_EXTRA_ARGS"
+
+	sonobuoyK8sVersionKey = "SONOBUOY_K8S_VERSION"
 )
 
 // templateValues are used for direct template substitution for manifest generation.
@@ -57,9 +57,11 @@ type templateValues struct {
 	ImagePullSecrets  string
 	CustomAnnotations map[string]string
 	SSHKey            string
-	SSHUser           string
 
 	NodeSelectors map[string]string
+
+	// configmap name, filename, string
+	ConfigMaps map[string]map[string]string
 
 	// CustomRegistries should be a multiline yaml string which represents
 	// the file contents of KUBE_TEST_REPO_LIST, the overrides for k8s e2e
@@ -68,13 +70,21 @@ type templateValues struct {
 }
 
 // GenerateManifest fills in a template with a Sonobuoy config
-func (*SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
+func (c *SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
+	b, _, err := c.GenerateManifestAndPlugins(cfg)
+	return b, err
+}
+
+// GenerateManifest fills in a template with a Sonobuoy config and also provides the objects
+// representing the plugins. This is useful if you want to do any structured handling of the resulting
+// plugins that would have been run.
+func (*SonobuoyClient) GenerateManifestAndPlugins(cfg *GenConfig) ([]byte, []*manifest.Manifest, error) {
 	if cfg == nil {
-		return nil, errors.New("nil GenConfig provided")
+		return nil, nil, errors.New("nil GenConfig provided")
 	}
 
 	if err := cfg.Validate(); err != nil {
-		return nil, errors.Wrap(err, "config validation failed")
+		return nil, nil, errors.Wrap(err, "config validation failed")
 	}
 
 	// Allow nil cfg.Config but avoid dereference errors.
@@ -85,7 +95,7 @@ func (*SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
 
 	marshalledConfig, err := json.Marshal(conf)
 	if err != nil {
-		return nil, errors.Wrap(err, "couldn't marshall selector")
+		return nil, nil, errors.Wrap(err, "couldn't marshall selector")
 	}
 
 	sshKeyData := []byte{}
@@ -93,24 +103,17 @@ func (*SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
 		var err error
 		sshKeyData, err = ioutil.ReadFile(cfg.SSHKeyPath)
 		if err != nil {
-			return nil, errors.Wrapf(err, "unable to read SSH key file: %v", cfg.SSHKeyPath)
+			return nil, nil, errors.Wrapf(err, "unable to read SSH key file: %v", cfg.SSHKeyPath)
 		}
 	}
 
-	// Support legacy logic for the time being.
+	// If the user didnt provide plugins at all fallback to our original
+	// defaults. Legacy logic was that the user could specify plugins via the
+	// config.PluginSelection field but since the CLI handles custom plugins
+	// we moved to the list of actual plugin data. The PluginSelection is only
+	// a server-side capability to run a subset of available plugins.
 	if len(cfg.DynamicPlugins) == 0 && len(cfg.StaticPlugins) == 0 {
-		if conf.PluginSelections != nil {
-			// Empty (but non-nil) means run nothing. Setting any value means run
-			// those explicitly.
-			for _, v := range conf.PluginSelections {
-				cfg.DynamicPlugins = append(cfg.DynamicPlugins, v.Name)
-			}
-		} else {
-			// Nil plugin selection now means to run all plugins that are loaded.
-			// If the user didnt provide plugins at all fallback to our original
-			// defaults.
-			cfg.DynamicPlugins = []string{e2ePluginName, systemdLogsName}
-		}
+		cfg.DynamicPlugins = []string{e2ePluginName, systemdLogsName}
 	}
 
 	plugins := []*manifest.Manifest{}
@@ -128,38 +131,84 @@ func (*SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
 		return strings.ToLower(plugins[i].SonobuoyConfig.PluginName) < strings.ToLower(plugins[j].SonobuoyConfig.PluginName)
 	})
 
-	err = checkPluginsUnique(plugins)
-	if err != nil {
-		return nil, errors.Wrap(err, "plugin YAML generation")
+	// Apply our universal transforms; only applies to ImagePullPolicy. Overrides all
+	// plugin values.
+	for _, p := range plugins {
+		p.Spec.ImagePullPolicy = corev1.PullPolicy(conf.ImagePullPolicy)
 	}
 
-	if cfg.PluginEnvOverrides != nil {
-		for pluginName, envVars := range cfg.PluginEnvOverrides {
-			found := false
-			for _, p := range plugins {
-				if p.SonobuoyConfig.PluginName == pluginName {
-					found = true
-					newEnv := []corev1.EnvVar{}
-					removeVals := map[string]struct{}{}
-					for k, v := range envVars {
-						if v != "" {
-							newEnv = append(newEnv, corev1.EnvVar{Name: k, Value: v})
-						} else {
-							removeVals[k] = struct{}{}
-						}
+	// Apply transforms. Ensure this is before handling configmaps and applying the k8s_version.
+	for pluginName, transforms := range cfg.PluginTransforms {
+		for _, p := range plugins {
+			if p.SonobuoyConfig.PluginName == pluginName {
+				for _, transform := range transforms {
+					if err := transform(p); err != nil {
+						return nil, nil, err
 					}
-					p.Spec.Env = mergeEnv(newEnv, p.Spec.Env, removeVals)
 				}
+			}
+		}
+	}
+
+	// If they have a configmap, associate the plugin with that configmap for mounting.
+	configs := map[string]map[string]string{}
+	for _, p := range plugins {
+		if len(p.ConfigMap) == 0 {
+			continue
+		}
+		configs[p.SonobuoyConfig.PluginName] = p.ConfigMap
+		p.ExtraVolumes = append(p.ExtraVolumes,
+			manifest.Volume{
+				Volume: corev1.Volume{
+					Name: fmt.Sprintf("sonobuoy-%v-vol", p.SonobuoyConfig.PluginName),
+					VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: fmt.Sprintf("plugin-%v-cm", p.SonobuoyConfig.PluginName)},
+					}},
+				},
+			})
+		p.Spec.VolumeMounts = append(p.Spec.VolumeMounts,
+			corev1.VolumeMount{
+				Name:      fmt.Sprintf("sonobuoy-%v-vol", p.SonobuoyConfig.PluginName),
+				MountPath: "/tmp/sonobuoy/config",
+			},
+		)
+	}
+
+	err = checkPluginsUnique(plugins)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "plugin YAML generation")
+	}
+
+	cfg.PluginEnvOverrides, plugins = applyK8sVersion(cfg.KubeVersion, cfg.PluginEnvOverrides, plugins)
+
+	for pluginName, envVars := range cfg.PluginEnvOverrides {
+		found := false
+		for _, p := range plugins {
+			if p.SonobuoyConfig.PluginName == pluginName {
+				found = true
+				newEnv := []corev1.EnvVar{}
+				removeVals := map[string]struct{}{}
+				for k, v := range envVars {
+					if v != "" {
+						newEnv = append(newEnv, corev1.EnvVar{Name: k, Value: v})
+					} else {
+						removeVals[k] = struct{}{}
+					}
+				}
+				p.Spec.Env = mergeEnv(newEnv, p.Spec.Env, removeVals)
+			}
+		}
+
+		// Require overrides to target existing plugins and provide a helpful message if there is a mismatch.
+		// Dont error if the plugin in question is "e2e" since we default to setting those values regardless of
+		// if they choose that plugin or not.
+		if !found && pluginName != e2ePluginName {
+			pluginNames := []string{}
+			for _, p := range plugins {
+				pluginNames = append(pluginNames, p.SonobuoyConfig.PluginName)
 			}
 
-			// Require overrides to target existing plugins and provide a helpful message if there is a mismatch.
-			if !found {
-				pluginNames := []string{}
-				for _, p := range plugins {
-					pluginNames = append(pluginNames, p.SonobuoyConfig.PluginName)
-				}
-				return nil, fmt.Errorf("failed to override env vars for plugin %v, no plugin with that name found; have plugins: %v", pluginName, pluginNames)
-			}
+			return nil, nil, fmt.Errorf("failed to override env vars for plugin %v, no plugin with that name found; have plugins: %v", pluginName, pluginNames)
 		}
 	}
 
@@ -167,7 +216,7 @@ func (*SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
 	for _, v := range plugins {
 		yaml, err := manifesthelper.ToYAML(v, cfg.ShowDefaultPodSpec)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		pluginYAML = append(pluginYAML, strings.TrimSpace(string(yaml)))
 	}
@@ -181,23 +230,36 @@ func (*SonobuoyClient) GenerateManifest(cfg *GenConfig) ([]byte, error) {
 		ImagePullSecrets:  conf.ImagePullSecrets,
 		CustomAnnotations: conf.CustomAnnotations,
 		SSHKey:            base64.StdEncoding.EncodeToString(sshKeyData),
-		SSHUser:           cfg.SSHUser,
 
 		Plugins: pluginYAML,
 
 		NodeSelectors: cfg.NodeSelectors,
 
-		// Often created from reading a file, this value could have trailing newline.
-		CustomRegistries: strings.TrimSpace(cfg.E2EConfig.CustomRegistries),
+		ConfigMaps: configs,
 	}
 
 	var buf bytes.Buffer
 
-	if err := templates.Manifest.Execute(&buf, tmplVals); err != nil {
-		return nil, errors.Wrap(err, "couldn't execute manifest template")
+	if err := genManifest.Execute(&buf, tmplVals); err != nil {
+		return nil, nil, errors.Wrap(err, "couldn't execute manifest template")
 	}
 
-	return buf.Bytes(), nil
+	return buf.Bytes(), plugins, nil
+}
+
+func applyK8sVersion(imageVersion string, env map[string]map[string]string, plugins []*manifest.Manifest) (map[string]map[string]string, []*manifest.Manifest) {
+	// Set env on all plugins and swap out dynamic images.
+	if env == nil {
+		env = map[string]map[string]string{}
+	}
+	for i, p := range plugins {
+		if env[p.SonobuoyConfig.PluginName] == nil {
+			env[p.SonobuoyConfig.PluginName] = map[string]string{}
+		}
+		env[p.SonobuoyConfig.PluginName][sonobuoyK8sVersionKey] = imageVersion
+		plugins[i].Spec.Image = strings.ReplaceAll(plugins[i].Spec.Image, "$"+sonobuoyK8sVersionKey, imageVersion)
+	}
+	return env, plugins
 }
 
 func checkPluginsUnique(plugins []*manifest.Manifest) error {
@@ -249,8 +311,8 @@ func SystemdLogsManifest(cfg *GenConfig) *manifest.Manifest {
 		Spec: manifest.Container{
 			Container: corev1.Container{
 				Name:            "systemd-logs",
-				Image:           cfg.SystemdLogsImage,
-				Command:         []string{"/bin/sh", "-c", `/get_systemd_logs.sh && while true; do echo "Sleeping for 1h to avoid daemonset restart"; sleep 3600; done`},
+				Image:           config.DefaultSystemdLogsImage,
+				Command:         []string{"/bin/sh", "-c", `/get_systemd_logs.sh; while true; do echo "Plugin is complete. Sleeping indefinitely to avoid container exit and automatic restarts from Kubernetes"; sleep 3600; done`},
 				ImagePullPolicy: corev1.PullPolicy(cfg.ImagePullPolicy),
 				Env: []corev1.EnvVar{
 					{Name: "CHROOT_DIR", Value: "/node"},
@@ -294,13 +356,13 @@ func E2EManifest(cfg *GenConfig) *manifest.Manifest {
 		Spec: manifest.Container{
 			Container: corev1.Container{
 				Name:            "e2e",
-				Image:           cfg.KubeConformanceImage,
+				Image:           fmt.Sprintf("%v:%v", config.UpstreamKubeConformanceImageURL, "$SONOBUOY_K8S_VERSION"),
 				Command:         []string{"/run_e2e.sh"},
 				ImagePullPolicy: corev1.PullPolicy(cfg.ImagePullPolicy),
 				Env: []corev1.EnvVar{
-					{Name: "E2E_FOCUS", Value: cfg.E2EConfig.Focus},
-					{Name: "E2E_SKIP", Value: cfg.E2EConfig.Skip},
-					{Name: "E2E_PARALLEL", Value: cfg.E2EConfig.Parallel},
+					{Name: "E2E_FOCUS", Value: cfg.PluginEnvOverrides["e2e"]["E2E_FOCUS"]},
+					{Name: "E2E_SKIP", Value: cfg.PluginEnvOverrides["e2e"]["E2E_SKIP"]},
+					{Name: "E2E_PARALLEL", Value: cfg.PluginEnvOverrides["e2e"]["E2E_PARALLEL"]},
 					{Name: "E2E_USE_GO_RUNNER", Value: "true"},
 				},
 				VolumeMounts: []corev1.VolumeMount{
@@ -313,80 +375,14 @@ func E2EManifest(cfg *GenConfig) *manifest.Manifest {
 			},
 		},
 	}
-
-	// Add volume mount, volume, and env var for custom registries.
-	if len(cfg.E2EConfig.CustomRegistries) > 0 {
-		m.ExtraVolumes = append(m.ExtraVolumes, manifest.Volume{
-			Volume: corev1.Volume{
-				Name: "repolist-vol",
-				VolumeSource: corev1.VolumeSource{
-					ConfigMap: &corev1.ConfigMapVolumeSource{
-						LocalObjectReference: corev1.LocalObjectReference{Name: "repolist-cm"},
-					},
-				},
-			},
-		})
-		m.Spec.Env = append(m.Spec.Env, corev1.EnvVar{
-			Name: "KUBE_TEST_REPO_LIST", Value: "/tmp/sonobuoy/repo-list.yaml",
-		})
-		m.Spec.VolumeMounts = append(m.Spec.VolumeMounts,
-			corev1.VolumeMount{
-				ReadOnly:  false,
-				Name:      "repolist-vol",
-				MountPath: "/tmp/sonobuoy",
-			},
-		)
+	m.PodSpec = &manifest.PodSpec{
+		PodSpec: driver.DefaultPodSpec(m.SonobuoyConfig.Driver),
 	}
+	m.PodSpec.PodSpec.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
 
-	// Add volume mount, volume, and 3 env vars (for different possible platforms) for SSH capabilities.
-	if len(cfg.SSHKeyPath) > 0 {
-		defMode := int32(256)
-		m.ExtraVolumes = append(m.ExtraVolumes, manifest.Volume{
-			Volume: corev1.Volume{
-				Name: "sshkey-vol",
-				VolumeSource: corev1.VolumeSource{
-					Secret: &corev1.SecretVolumeSource{
-						SecretName:  "ssh-key",
-						DefaultMode: &defMode,
-					},
-				},
-			},
-		})
-		m.Spec.Env = append(m.Spec.Env,
-			corev1.EnvVar{Name: "LOCAL_SSH_KEY", Value: "id_rsa"},
-			corev1.EnvVar{Name: "AWS_SSH_KEY", Value: "/root/.ssh/id_rsa"},
-			corev1.EnvVar{Name: "KUBE_SSH_KEY", Value: "id_rsa"},
-		)
-		m.Spec.VolumeMounts = append(m.Spec.VolumeMounts,
-			corev1.VolumeMount{
-				ReadOnly:  false,
-				Name:      "sshkey-vol",
-				MountPath: "/root/.ssh",
-			},
-		)
-	}
-
-	if len(cfg.SSHUser) > 0 {
-		m.Spec.Env = append(m.Spec.Env,
-			corev1.EnvVar{Name: "KUBE_SSH_USER", Value: cfg.SSHUser},
-		)
-	}
-
-	if e2eImageSupportsProgress(cfg.KubeConformanceImage) {
-		m.Spec.Env = updateExtraArgs(m.Spec.Env, cfg.Config.ProgressUpdatesPort)
-	}
+	m.Spec.Env = updateExtraArgs(m.Spec.Env, cfg.Config.ProgressUpdatesPort)
 
 	return m
-}
-
-func e2eImageSupportsProgress(imageName string) bool {
-	parts := strings.SplitAfter(imageName, ":")
-	tag := parts[len(parts)-1]
-	imageVersion, err := version.NewVersion(tag)
-	if err != nil {
-		return false
-	}
-	return imageVersion.GreaterThan(version.Must(version.NewVersion(lastE2EVersionWithoutProgress)))
 }
 
 // updateExtraArgs adds the flag expected by the e2e plugin for the progress report URL.

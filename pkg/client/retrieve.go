@@ -19,43 +19,38 @@ package client
 import (
 	"archive/tar"
 	"compress/gzip"
-	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/vmware-tanzu/sonobuoy/pkg/config"
 	pluginaggregation "github.com/vmware-tanzu/sonobuoy/pkg/plugin/aggregation"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-const (
-	nodeOSLabelBeta = "beta.kubernetes.io/os"
-	nodeOSLabel     = "kubernetes.io/os"
-	nodeOSWindows   = "windows"
-)
-
 var (
-	linuxTarCommand = []string{
+	tarCmd = []string{
 		"/sonobuoy",
 		"splat",
 		config.AggregatorResultsPath,
 	}
-
-	winTarCommand = []string{
-		"powershell.exe",
-		"-Command",
-		fmt.Sprintf(`& {tar -cC %s --format pax -f - *.tar.gz}`, config.AggregatorResultsPath),
-	}
 )
+
+type DeletionError struct {
+	filename string
+	err      error
+}
+
+func (d *DeletionError) Error() string {
+	return errors.Wrapf(d.err, "failed to delete file %q", d.filename).Error()
+}
 
 // RetrieveResults copies results from a sonobuoy run into a Reader in tar format.
 // It also returns a channel of errors, where any errors encountered when writing results
@@ -81,11 +76,6 @@ func (c *SonobuoyClient) RetrieveResults(cfg *RetrieveConfig) (io.Reader, <-chan
 		return nil, nil, errors.Wrap(err, "failed to get the name of the aggregator pod to fetch results from")
 	}
 
-	tarCommand := linuxTarCommand
-	if isWin, _ := isPodRunningOnWindowsNode(client, cfg.Namespace, podName); isWin {
-		tarCommand = winTarCommand
-	}
-
 	restClient := client.CoreV1().RESTClient()
 	req := restClient.Post().
 		Resource("pods").
@@ -95,7 +85,7 @@ func (c *SonobuoyClient) RetrieveResults(cfg *RetrieveConfig) (io.Reader, <-chan
 		Param("container", config.AggregatorContainerName)
 	req.VersionedParams(&corev1.PodExecOptions{
 		Container: config.AggregatorContainerName,
-		Command:   tarCommand,
+		Command:   tarCmd,
 		Stdin:     false,
 		Stdout:    true,
 		Stderr:    false,
@@ -121,34 +111,6 @@ func (c *SonobuoyClient) RetrieveResults(cfg *RetrieveConfig) (io.Reader, <-chan
 	return reader, ec, nil
 }
 
-func isPodRunningOnWindowsNode(client kubernetes.Interface, ns, podName string) (bool, error) {
-	pod, err := client.CoreV1().Pods(ns).Get(context.TODO(), podName, metav1.GetOptions{})
-	if err != nil {
-		return false, errors.Wrapf(err, "unable to get pod %v in namespace %v", podName, ns)
-	}
-
-	nodeName := pod.Spec.NodeName
-	if nodeName == "" {
-		return false, nil
-	}
-
-	node, err := client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
-	if err != nil {
-		return false, errors.Wrapf(err, "unable to get node %v", nodeName)
-	}
-
-	for k, v := range node.ObjectMeta.Labels {
-		if k == nodeOSLabel && v == nodeOSWindows {
-			return true, nil
-		}
-		if k == nodeOSLabelBeta && v == nodeOSWindows {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
 /** Everything below this marker originally was copy/pasta'd from k8s/k8s. The modification are:
   exporting UntarAll, returning the list of files created, and the fix for undrained readers  **/
 
@@ -160,6 +122,7 @@ func UntarAll(reader io.Reader, destFile, prefix string) (filenames []string, re
 	filenames = []string{}
 	// Adding compression per `splat` subcommand implementation
 	gzReader, err := gzip.NewReader(reader)
+
 	if err != nil {
 		returnErr = err
 		return
@@ -194,6 +157,13 @@ func UntarAll(reader io.Reader, destFile, prefix string) (filenames []string, re
 			}
 			break
 		}
+
+		// Avoid naively joining paths and allowing escape of intended directory.
+		// Recommended by github CodeQL; go/zipslip
+		if strings.Contains(header.Name, "..") {
+			continue
+		}
+
 		entrySeq++
 		mode := header.FileInfo().Mode()
 		outFileName := filepath.Join(destFile, header.Name[len(prefix):])
@@ -247,6 +217,27 @@ func UntarAll(reader io.Reader, destFile, prefix string) (filenames []string, re
 		return filenames, errors.New(errInfo)
 	}
 	return filenames, nil
+}
+
+// UntarFile untars the file, filename, into the given destination directory with the given prefix. If delete
+// is true, it deletes the original file after extraction.
+func UntarFile(filename string, destination string, delete bool) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return errors.Wrapf(err, "failed to open file %q for extraction after downloading it", filename)
+	}
+	defer f.Close()
+
+	_, err = UntarAll(f, destination, "")
+	if err != nil {
+		return errors.Wrapf(err, "failed to extract file %q after downloading it", filename)
+	}
+	if err := os.Remove(filename); err != nil {
+		// Returning a specific type of error so that consumers can ignore if desired. The file did
+		// get untar'd successfully and so this error has less significance.
+		return &DeletionError{filename: filename, err: err}
+	}
+	return nil
 }
 
 // dirExists checks if a path exists and is a directory.

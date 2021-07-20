@@ -38,8 +38,6 @@ type runFlags struct {
 }
 
 var (
-	runflags runFlags
-
 	allowedGenFlagsWithRunFile = []string{kubeconfig, kubecontext}
 )
 
@@ -61,12 +59,8 @@ func RunFlagSet(cfg *runFlags) *pflag.FlagSet {
 func (r *runFlags) Config() (*client.RunConfig, error) {
 	runcfg := &client.RunConfig{
 		Wait:       time.Duration(r.wait) * time.Minute,
-		WaitOutput: runflags.waitOutput.String(),
+		WaitOutput: r.waitOutput.String(),
 		GenFile:    r.genFile,
-	}
-
-	if r.genFile != "" && givenAnyGenConfigFlags(&(r.genFlags), allowedGenFlagsWithRunFile) {
-		return nil, fmt.Errorf("setting the --file flag is incompatible with any other options")
 	}
 
 	if r.genFile == "" {
@@ -80,9 +74,9 @@ func (r *runFlags) Config() (*client.RunConfig, error) {
 	return runcfg, nil
 }
 
-func givenAnyGenConfigFlags(gf *genFlags, allowedFlagNames []string) bool {
+func givenAnyGenConfigFlags(fs *pflag.FlagSet, allowedFlagNames []string) bool {
 	changed := false
-	gf.genflags.Visit(func(f *pflag.Flag) {
+	fs.Visit(func(f *pflag.Flag) {
 		if changed {
 			return
 		}
@@ -94,48 +88,62 @@ func givenAnyGenConfigFlags(gf *genFlags, allowedFlagNames []string) bool {
 }
 
 func NewCmdRun() *cobra.Command {
+	var f runFlags
+	fs := RunFlagSet(&f)
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Submits a sonobuoy run",
-		Run:   submitSonobuoyRun,
-		Args:  cobra.ExactArgs(0),
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			return checkFlagValidity(fs, f)
+		},
+		Run:  submitSonobuoyRun(&f),
+		Args: cobra.ExactArgs(0),
 	}
 
-	cmd.Flags().AddFlagSet(RunFlagSet(&runflags))
+	cmd.Flags().AddFlagSet(fs)
 	return cmd
 }
 
-func submitSonobuoyRun(cmd *cobra.Command, args []string) {
-	sbc, err := getSonobuoyClientFromKubecfg(runflags.kubecfg)
-	if err != nil {
-		errlog.LogError(errors.Wrap(err, "could not create sonobuoy client"))
-		os.Exit(1)
+func checkFlagValidity(fs *pflag.FlagSet, rf runFlags) error {
+	if rf.genFile != "" && givenAnyGenConfigFlags(fs, allowedGenFlagsWithRunFile) {
+		return fmt.Errorf("setting the --file flag is incompatible with any other options besides %v", allowedGenFlagsWithRunFile)
 	}
+	return nil
+}
 
-	runCfg, err := runflags.Config()
-	if err != nil {
-		errlog.LogError(errors.Wrap(err, "could not retrieve E2E config"))
-		os.Exit(1)
-	}
-
-	if !runflags.skipPreflight {
-		pcfg := &client.PreflightConfig{
-			Namespace:    runflags.namespace,
-			DNSNamespace: runflags.dnsNamespace,
-			DNSPodLabels: runflags.dnsPodLabels,
-		}
-		if errs := sbc.PreflightChecks(pcfg); len(errs) > 0 {
-			errlog.LogError(errors.New("Preflight checks failed"))
-			for _, err := range errs {
-				errlog.LogError(err)
-			}
+func submitSonobuoyRun(f *runFlags) func(cmd *cobra.Command, args []string) {
+	return func(cmd *cobra.Command, args []string) {
+		sbc, err := getSonobuoyClientFromKubecfg(f.kubecfg)
+		if err != nil {
+			errlog.LogError(errors.Wrap(err, "could not create sonobuoy client"))
 			os.Exit(1)
 		}
-	}
 
-	if err := sbc.Run(runCfg); err != nil {
-		errlog.LogError(errors.Wrap(err, "error attempting to run sonobuoy"))
-		os.Exit(1)
+		runCfg, err := f.Config()
+		if err != nil {
+			errlog.LogError(errors.Wrap(err, "could not retrieve E2E config"))
+			os.Exit(1)
+		}
+
+		if !f.skipPreflight {
+			pcfg := &client.PreflightConfig{
+				Namespace:    f.sonobuoyConfig.Namespace,
+				DNSNamespace: f.dnsNamespace,
+				DNSPodLabels: f.dnsPodLabels,
+			}
+			if errs := sbc.PreflightChecks(pcfg); len(errs) > 0 {
+				errlog.LogError(errors.New("Preflight checks failed"))
+				for _, err := range errs {
+					errlog.LogError(err)
+				}
+				os.Exit(1)
+			}
+		}
+
+		if err := sbc.Run(runCfg); err != nil {
+			errlog.LogError(errors.Wrap(err, "error attempting to run sonobuoy"))
+			os.Exit(1)
+		}
 	}
 }
 

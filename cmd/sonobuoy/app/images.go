@@ -28,6 +28,7 @@ import (
 	"github.com/vmware-tanzu/sonobuoy/pkg/config"
 	"github.com/vmware-tanzu/sonobuoy/pkg/errlog"
 	"github.com/vmware-tanzu/sonobuoy/pkg/image"
+	"github.com/vmware-tanzu/sonobuoy/pkg/plugin/manifest"
 )
 
 // Number times to retry docker commands before giving up
@@ -43,8 +44,13 @@ type imagesFlags struct {
 	kubeconfig        Kubeconfig
 	customRegistry    string
 	dryRun            bool
-	k8sVersion        string
+	k8sVersion        image.ConformanceImageVersion
 }
+
+var (
+	// transformSink avoids nil issues despite not really needing the transforms for these commands.
+	transformSink = map[string][]func(*manifest.Manifest) error{}
+)
 
 func NewCmdImages() *cobra.Command {
 	var flags imagesFlags
@@ -74,7 +80,7 @@ func NewCmdImages() *cobra.Command {
 
 	AddKubeconfigFlag(&flags.kubeconfig, cmd.Flags())
 	AddPluginListFlag(&flags.plugins, cmd.Flags())
-	AddKubernetesVersionFlag(&flags.k8sVersion, cmd.Flags())
+	AddKubernetesVersionFlag(&flags.k8sVersion, &transformSink, cmd.Flags())
 
 	cmd.AddCommand(pullCmd())
 	cmd.AddCommand(pushCmd())
@@ -115,7 +121,7 @@ func pullCmd() *cobra.Command {
 	AddKubeconfigFlag(&flags.kubeconfig, pullCmd.Flags())
 	AddPluginListFlag(&flags.plugins, pullCmd.Flags())
 	AddDryRunFlag(&flags.dryRun, pullCmd.Flags())
-	AddKubernetesVersionFlag(&flags.k8sVersion, pullCmd.Flags())
+	AddKubernetesVersionFlag(&flags.k8sVersion, &transformSink, pullCmd.Flags())
 
 	return pullCmd
 }
@@ -158,7 +164,7 @@ func pushCmd() *cobra.Command {
 	AddCustomRegistryFlag(&flags.customRegistry, pushCmd.Flags())
 	AddDryRunFlag(&flags.dryRun, pushCmd.Flags())
 	pushCmd.MarkFlagRequired(customRegistryFlag)
-	AddKubernetesVersionFlag(&flags.k8sVersion, pushCmd.Flags())
+	AddKubernetesVersionFlag(&flags.k8sVersion, &transformSink, pushCmd.Flags())
 
 	return pushCmd
 }
@@ -191,7 +197,7 @@ func downloadCmd() *cobra.Command {
 	AddKubeconfigFlag(&flags.kubeconfig, downloadCmd.Flags())
 	AddPluginListFlag(&flags.plugins, downloadCmd.Flags())
 	AddDryRunFlag(&flags.dryRun, downloadCmd.Flags())
-	AddKubernetesVersionFlag(&flags.k8sVersion, downloadCmd.Flags())
+	AddKubernetesVersionFlag(&flags.k8sVersion, &transformSink, downloadCmd.Flags())
 
 	return downloadCmd
 }
@@ -209,7 +215,7 @@ func deleteCmd() *cobra.Command {
 				client = image.NewDockerClient()
 			}
 
-			if errs := deleteImages(flags.plugins, flags.kubeconfig, flags.e2eRegistryConfig, flags.k8sVersion, client); len(errs) > 0 {
+			if errs := deleteImages(flags.plugins, flags.kubeconfig, flags.e2eRegistryConfig, flags.k8sVersion.String(), client); len(errs) > 0 {
 				for _, err := range errs {
 					errlog.LogError(err)
 				}
@@ -222,26 +228,26 @@ func deleteCmd() *cobra.Command {
 	AddKubeconfigFlag(&flags.kubeconfig, deleteCmd.Flags())
 	AddPluginListFlag(&flags.plugins, deleteCmd.Flags())
 	AddDryRunFlag(&flags.dryRun, deleteCmd.Flags())
-	AddKubernetesVersionFlag(&flags.k8sVersion, deleteCmd.Flags())
+	AddKubernetesVersionFlag(&flags.k8sVersion, &transformSink, deleteCmd.Flags())
 
 	return deleteCmd
 }
 
 // getClusterVersion will return either the given string or, if empty, use the kubeconfig
 // to reach out to the server and check its version.
-func getClusterVersion(k8sVersion string, kubeconfig Kubeconfig) (string, error) {
-	if len(k8sVersion) > 0 {
-		return k8sVersion, nil
+func getClusterVersion(k8sVersion image.ConformanceImageVersion, kubeconfig Kubeconfig) (string, error) {
+	if len(k8sVersion.String()) > 0 && k8sVersion != image.ConformanceImageVersionAuto {
+		return k8sVersion.String(), nil
 	}
 
 	sbc, err := getSonobuoyClientFromKubecfg(kubeconfig)
 	if err != nil {
-		return "", errors.Wrap(err, "couldn't create sonobuoy client")
+		return "", errors.Wrap(err, "couldn't create sonobuoy client in order to check Kubernetes version")
 	}
 
 	version, err := sbc.Version()
 	if err != nil {
-		return "", errors.Wrap(err, "couldn't get Sonobuoy client")
+		return "", errors.Wrap(err, "couldn't determine Kubernetes version from cluster")
 	}
 
 	return version, nil

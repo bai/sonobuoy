@@ -19,6 +19,7 @@ package app
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/vmware-tanzu/sonobuoy/pkg/client"
 	"github.com/vmware-tanzu/sonobuoy/pkg/client/results"
@@ -53,8 +54,16 @@ type GenPluginDefConfig struct {
 	// Allows validation during flag parsing by having a custom type.
 	driver pluginDriver
 
+	// nodeSelector is the node selectors to put into the podSpec for the plugin.
+	// Separate field here since the default podSpec is nil but we also have to deal
+	// with defaults. Easy to reconcile this way.
+	nodeSelector map[string]string
+
 	// If set, the default pod spec used by Sonobuoy will be included in the output
 	showDefaultPodSpec bool
+
+	// configMapFiles is the list of files to read/store as configmaps for the plugin.
+	configMapFiles []string
 }
 
 // NewCmdGenPluginDef ...
@@ -89,6 +98,11 @@ func NewCmdGenPluginDef() *cobra.Command {
 		"Result format (junit or raw)",
 	)
 
+	genPluginSet.StringToStringVar(
+		&genPluginOpts.nodeSelector, "node-selector", nil,
+		`Node selector for the plugin (key=value). Usually set to specify OS via kubernetes.io/os=windows. Can be set multiple times.`,
+	)
+
 	genPluginSet.StringVarP(
 		&genPluginOpts.def.Spec.Image, "image", "i", "",
 		"Plugin image",
@@ -107,6 +121,11 @@ func NewCmdGenPluginDef() *cobra.Command {
 	genPluginSet.StringArrayVarP(
 		&genPluginOpts.def.Spec.Args, "arg", "a", []string{},
 		"Arg values to set on the plugin. Can be set multiple times (e.g. --arg 'arg 1' --arg arg2)",
+	)
+
+	genPluginSet.StringArrayVar(
+		&genPluginOpts.configMapFiles, "configmap", nil,
+		`Specifies files to read and add as configMaps. Will be mounted to the plugin at /tmp/sonobuoy/configs/<filename>.`,
 	)
 
 	AddShowDefaultPodSpecFlag(&genPluginOpts.showDefaultPodSpec, genPluginSet)
@@ -168,60 +187,84 @@ func genPluginDef(cfg *GenPluginDefConfig) ([]byte, error) {
 		}
 	}
 
+	if cfg.nodeSelector != nil {
+		// Initialize podSpec first
+		if cfg.def.PodSpec == nil {
+			cfg.def.PodSpec = &manifest.PodSpec{}
+		}
+		cfg.def.PodSpec.NodeSelector = cfg.nodeSelector
+	}
+
+	if len(cfg.configMapFiles) > 0 {
+		cfg.def.ConfigMap = map[string]string{}
+	}
+	for _, v := range cfg.configMapFiles {
+		fData, err := os.ReadFile(v)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to read file %q", v)
+		}
+		base := filepath.Base(v)
+		cfg.def.ConfigMap[base] = string(fData)
+	}
+
 	yaml, err := kuberuntime.Encode(manifest.Encoder, &cfg.def)
 	return yaml, errors.Wrap(err, "serializing as YAML")
 }
 
 func NewCmdGenE2E() *cobra.Command {
+	var genE2Eflags genFlags
+	configMapFiles := []string{}
+
 	var cmd = &cobra.Command{
 		Use:   "e2e",
 		Short: "Generates the e2e plugin definition based on the given options",
-		RunE:  genE2EManifest,
+		RunE:  genManifestForPlugin(&genE2Eflags, e2ePlugin),
 		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().AddFlagSet(GenFlagSet(&genE2Eflags, EnabledRBACMode))
+	cmd.Flags().StringArrayVar(
+		&configMapFiles, "configmap", nil,
+		`Specifies files to read and add as configMaps. Will be mounted to the plugin at /tmp/sonobuoy/configs/<filename>.`,
+	)
 	return cmd
 }
 
-func genE2EManifest(cmd *cobra.Command, args []string) error {
-	cfg, err := genflags.Config()
-	if err != nil {
-		return err
-	}
+func genManifestForPlugin(genflags *genFlags, pluginName string) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		cfg, err := genflags.Config()
+		if err != nil {
+			return err
+		}
 
-	m := client.E2EManifest(cfg)
-	yaml, err := manifesthelper.ToYAML(m, cfg.ShowDefaultPodSpec)
-	if err != nil {
-		return err
-	}
+		// Generate does not require any client configuration
+		sbc := &client.SonobuoyClient{}
 
-	fmt.Println(string(yaml))
-	return nil
+		_, plugins, err := sbc.GenerateManifestAndPlugins(cfg)
+		if err != nil {
+			return errors.Wrap(err, "error attempting to generate sonobuoy manifest")
+		}
+
+		for _, p := range plugins {
+			if p.Spec.Name == pluginName {
+				yaml, err := manifesthelper.ToYAML(p, cfg.ShowDefaultPodSpec)
+				if err != nil {
+					return errors.Wrap(err, "error attempting to serialize plugin")
+				}
+				fmt.Print(string(yaml))
+			}
+		}
+		return nil
+	}
 }
 
 func NewCmdGenSystemdLogs() *cobra.Command {
+	var genSystemdLogsflags genFlags
 	var cmd = &cobra.Command{
 		Use:   "systemd-logs",
 		Short: "Generates the systemd-logs plugin definition based on the given options",
-		RunE:  genSystemdLogsManifest,
+		RunE:  genManifestForPlugin(&genSystemdLogsflags, systemdLogsPlugin),
 		Args:  cobra.NoArgs,
 	}
 	cmd.Flags().AddFlagSet(GenFlagSet(&genSystemdLogsflags, EnabledRBACMode))
 	return cmd
-}
-
-func genSystemdLogsManifest(cmd *cobra.Command, args []string) error {
-	cfg, err := genflags.Config()
-	if err != nil {
-		return err
-	}
-
-	m := client.SystemdLogsManifest(cfg)
-	yaml, err := manifesthelper.ToYAML(m, cfg.ShowDefaultPodSpec)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(string(yaml))
-	return nil
 }

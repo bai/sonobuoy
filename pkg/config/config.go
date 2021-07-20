@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
-	uuid "github.com/satori/go.uuid"
 	"github.com/vmware-tanzu/sonobuoy/pkg/buildinfo"
 	"github.com/vmware-tanzu/sonobuoy/pkg/plugin"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,7 +42,7 @@ const (
 	// DefaultAggregationServerBindAddress is the default address for the aggregation server to bind to.
 	DefaultAggregationServerBindAddress = "0.0.0.0"
 	// DefaultAggregationServerTimeoutSeconds is the default amount of time the aggregation server will wait for all plugins to complete.
-	DefaultAggregationServerTimeoutSeconds = 10800 // 180 min
+	DefaultAggregationServerTimeoutSeconds = 21600 // 360 min
 	// AggregatorPodName is the name of the main pod that runs plugins and collects results.
 	AggregatorPodName = "sonobuoy"
 	// AggregatorContainerName is the name of the main container in the aggregator pod.
@@ -68,7 +67,7 @@ const (
 
 var (
 	// DefaultKubeConformanceImage is the URL and tag of the docker image to run for the kube conformance tests.
-	DefaultKubeConformanceImage = DefaultKubeConformanceImageURL + ":" + DefaultKubeConformanceImageTag
+	DefaultKubeConformanceImage = DefaultKubeConformanceImageURL + ":" + "$SONOBUOY_K8S_VERSION"
 	// DefaultImage is the URL of the docker image to run for the aggregator and workers
 	DefaultImage = "sonobuoy/sonobuoy:" + buildinfo.Version
 	// DefaultResources is the default set of resources which are queried for after plugins run. The strings
@@ -346,8 +345,6 @@ func (c PodLogLimits) timeLimitDuration() (val time.Duration, defaulted bool, er
 // New returns a newly-constructed Config object with default values.
 func New() *Config {
 	var cfg Config
-	cfgUuid, _ := uuid.NewV4()
-	cfg.UUID = cfgUuid.String()
 	cfg.Description = "DEFAULT"
 	cfg.ResultsDir = AggregatorResultsPath
 	cfg.Version = buildinfo.Version

@@ -41,6 +41,9 @@ const (
 	ConformanceImageVersionAuto = "auto"
 	// ConformanceImageVersionLatest represents always using the server's latest dev version.
 	ConformanceImageVersionLatest = "latest"
+	// ConformanceImageVersionAuto represents detecting the server's kubernetes version but ignoring errors. Useful for
+	// debugging/testing when no cluster is present.
+	ConformanceImageVersionIgnore = "ignore"
 
 	// DevVersionURL is the URL which should respond with a simple text of the latest version for devs.
 	DevVersionURL      = "https://storage.googleapis.com/k8s-release-dev/ci/latest.txt"
@@ -62,6 +65,8 @@ func (c *ConformanceImageVersion) Set(str string) error {
 		*c = ConformanceImageVersionAuto
 	case ConformanceImageVersionLatest:
 		*c = ConformanceImageVersionLatest
+	case ConformanceImageVersionIgnore:
+		*c = ConformanceImageVersionIgnore
 	default:
 		version, err := validateVersion(str)
 		if err != nil {
@@ -82,7 +87,7 @@ func (c *ConformanceImageVersion) Set(str string) error {
 // Don't require the entire kubernetes.Interface to simplify the required test mocks
 func (c *ConformanceImageVersion) Get(client discovery.ServerVersionInterface, latestURL string) (registry, version string, returnErr error) {
 	switch *c {
-	case ConformanceImageVersionAuto:
+	case "", ConformanceImageVersionAuto:
 		if client == nil {
 			return "", "", ErrImageVersionNoClient
 		}
@@ -94,7 +99,7 @@ func (c *ConformanceImageVersion) Get(client discovery.ServerVersionInterface, l
 		ver, err := conformanceTagFromSemver(version.GitVersion)
 		return config.UpstreamKubeConformanceImageURL, ver, err
 	case ConformanceImageVersionLatest:
-		version, err := getLatestDevVersion(latestURL)
+		version, err := GetLatestDevVersion(latestURL)
 		if err != nil {
 			return "", "", errors.Wrap(err, "couldn't identify latest dev image")
 		}
@@ -104,8 +109,8 @@ func (c *ConformanceImageVersion) Get(client discovery.ServerVersionInterface, l
 	return config.UpstreamKubeConformanceImageURL, string(*c), nil
 }
 
-// getLatestDevVersion just GETs a known URL which holds the reference to the latest dev version.
-func getLatestDevVersion(url string) (string, error) {
+// GetLatestDevVersion just GETs a known URL which holds the reference to the latest dev version.
+func GetLatestDevVersion(url string) (string, error) {
 	r, err := http.Get(url)
 	if err != nil {
 		return "", err
